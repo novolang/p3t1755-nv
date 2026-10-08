@@ -1,0 +1,256 @@
+// p3t1755_tests: the driver's register logic over an I2C double, on the
+// host.
+//
+// The double answers as a P3T1755 at one address: a read at pointer 1
+// answers the configuration byte, a read at pointers 0, 2 and 3 the
+// register's two bytes, most significant first.  A trait method's
+// receiver is a plain `self`, so the double cannot record a write;
+// instead it acknowledges a write when the frame is the one the test
+// expects, or any write when the test expects none.  The type
+// `P3t1755` holds the board's bus; on the host that bus is absent
+// hardware, so the last test runs each of its methods as for a part that
+// does not answer, and the FRDM-MCXN947 package's suite runs them over
+// the part.
+//
+// The temperature vectors are the data sheet's Table 18.
+
+use std.test
+use embedded_hal.{ I2cBus, BoardI2c, BoardGpio }
+use dev_bus.{ DeviceWiring }
+use dev_thermo.{ TempMilliC }
+use p3t1755
+use p3t1755.{ P3t1755 }
+
+struct FakeP3t
+    addr: Int
+    temp: Int
+    conf: Int
+    tlow: Int
+    thigh: Int
+    expect: [Int]
+
+impl I2cBus for FakeP3t
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr
+            return false
+        if self.expect.len() == 0
+            return true
+        if data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        let p = tx[0] as Int
+        var out: [u8] = []
+        if p == 1
+            list.push(out, self.conf as u8)
+            return Some(out)
+        var word = self.temp
+        if p == 2
+            word = self.tlow
+        if p == 3
+            word = self.thigh
+        list.push(out, (word >> 8) as u8)
+        list.push(out, (word & 0xFF) as u8)
+        Some(out)
+
+let W = dev_bus.wiring_i2c(0, 0x48)
+
+// The part at its power-up values, reading `temp`, and acknowledging
+// the write `expect`.
+fn part(temp: Int, conf: Int, expect: [Int]) -> FakeP3t
+    FakeP3t { addr: 0x48, temp: temp, conf: conf, tlow: 0x4B00, thigh: 0x5000, expect: expect }
+
+// Nothing at the part's address.
+fn absent() -> FakeP3t
+    FakeP3t { addr: 0x49, temp: 0, conf: 0, tlow: 0, thigh: 0, expect: [] }
+
+fn milli(t: ?TempMilliC) -> Int
+    match t
+        Some(v) => v.milli_c
+        None    => -999999
+
+@test
+fn test_the_conversion_periods() [io]
+    test.assert_eq(p3t1755.rate_period_us(p3t1755.RATE_27_5_MS), 27500)
+    test.assert_eq(p3t1755.rate_period_us(p3t1755.RATE_55_MS), 55000)
+    test.assert_eq(p3t1755.rate_period_us(p3t1755.RATE_110_MS), 110000)
+    test.assert_eq(p3t1755.rate_period_us(p3t1755.RATE_220_MS), 220000)
+    test.assert_eq(p3t1755.rate_period_us(4), -1)
+    test.assert_eq(p3t1755.rate_period_us(-1), -1)
+
+@test
+fn test_the_data_sheets_temperatures() [io]
+    test.assert_eq(p3t1755.temp_of_word(0x7FF0).milli_c, 127937)
+    test.assert_eq(p3t1755.temp_of_word(0x7F00).milli_c, 127000)
+    test.assert_eq(p3t1755.temp_of_word(0x6400).milli_c, 100000)
+    test.assert_eq(p3t1755.temp_of_word(0x5000).milli_c, 80000)
+    test.assert_eq(p3t1755.temp_of_word(0x4B00).milli_c, 75000)
+    test.assert_eq(p3t1755.temp_of_word(0x1900).milli_c, 25000)
+    test.assert_eq(p3t1755.temp_of_word(0x0040).milli_c, 250)
+    test.assert_eq(p3t1755.temp_of_word(0x0000).milli_c, 0)
+
+@test
+fn test_a_negative_temperature_is_sign_extended_from_bit_11() [io]
+    test.assert_eq(p3t1755.temp_of_word(0xFFC0).milli_c, -250)
+    test.assert_eq(p3t1755.temp_of_word(0xE700).milli_c, -25000)
+    test.assert_eq(p3t1755.temp_of_word(0xD800).milli_c, -40000)
+    // The four low bits are not part of the count.
+    test.assert_eq(p3t1755.temp_of_word(0x190F).milli_c, 25000)
+
+@test
+fn test_a_limit_is_rounded_to_the_nearest_step() [io]
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: 74000 }), 0x4A00)
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: 75000 }), 0x4B00)
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: -25000 }), 0xE700)
+    // 74.030 °C is 1184.48 steps, 74.032 °C 1184.512.
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: 74030 }), 0x4A00)
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: 74032 }), 0x4A10)
+    // -0.030 °C is -0.48 steps, -0.032 °C -0.512.
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: -30 }), 0)
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: -32 }), 0xFFF0)
+
+@test
+fn test_a_limit_is_held_to_the_registers_range() [io]
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: 200000 }), 0x7FF0)
+    test.assert_eq(p3t1755.limit_word(TempMilliC { milli_c: -200000 }), 0x8000)
+    test.assert_eq(p3t1755.temp_of_word(p3t1755.limit_word(TempMilliC { milli_c: -200000 })).milli_c, -128000)
+
+@test
+fn test_the_registers_read() [io, hw]
+    let p = part(0x1900, 0x28, [])
+    test.assert(p3t1755.read_conf(p, W) == Some(0x28))
+    test.assert(p3t1755.read_word(p, W, p3t1755.REG_THIGH) == Some(0x5000))
+    test.assert_eq(milli(p3t1755.read_temp_reg(p, W, p3t1755.REG_TEMP)), 25000)
+    test.assert_eq(milli(p3t1755.read_temp_reg(p, W, p3t1755.REG_TLOW)), 75000)
+
+@test
+fn test_an_absent_part_answers_nothing() [io, hw]
+    let p = absent()
+    test.assert(p3t1755.read_conf(p, W) == None)
+    test.assert(p3t1755.read_word(p, W, 0) == None)
+    test.assert_eq(milli(p3t1755.read_temp_reg(p, W, 0)), -999999)
+    test.assert(not p3t1755.write_conf(p, W, 0x28))
+    test.assert(not p3t1755.write_word(p, W, 2, 0x4A00))
+    test.assert_eq(p3t1755.start(p, W), -1)
+    test.assert_eq(p3t1755.one_shot(p, W), -1)
+    test.assert_eq(p3t1755.shut_down(p, W), -1)
+    test.assert_eq(p3t1755.resume(p, W), -1)
+    test.assert_eq(p3t1755.set_rate(p, W, 1), -1)
+    test.assert(p3t1755.rate(p, W) == None)
+    test.assert(p3t1755.identify(p, W) == None)
+    test.assert(not p3t1755.at_reset(p, W))
+    test.assert(not p3t1755.restore(p, W))
+
+@test
+fn test_a_word_is_written_most_significant_byte_first() [io, hw]
+    test.assert(p3t1755.write_word(part(0, 0x28, [2, 0x4A, 0x00]), W, 2, 0x4A00))
+    test.assert(not p3t1755.write_word(part(0, 0x28, [2, 0x00, 0x4A]), W, 2, 0x4A00))
+
+@test
+fn test_a_continuous_part_starts_nothing() [io, hw]
+    test.assert_eq(p3t1755.start(part(0x1900, 0x28, [1, 0xA8]), W), 0)
+
+@test
+fn test_a_part_in_shutdown_starts_a_one_shot() [io, hw]
+    // OS written beside the configuration, SD kept.
+    test.assert_eq(p3t1755.start(part(0x1900, 0x29, [1, 0xA9]), W), 12000)
+    test.assert_eq(p3t1755.one_shot(part(0x1900, 0x29, [1, 0xA9]), W), 12000)
+    // A refused write is a refused start.
+    test.assert_eq(p3t1755.start(part(0x1900, 0x29, [1, 0x29]), W), -1)
+
+@test
+fn test_a_one_shot_is_refused_while_converting_continuously() [io, hw]
+    test.assert_eq(p3t1755.one_shot(part(0x1900, 0x28, []), W), -1)
+
+@test
+fn test_shutdown_and_resume_answer_one_period() [io, hw]
+    test.assert_eq(p3t1755.shut_down(part(0, 0x28, [1, 0x29]), W), 55000)
+    test.assert_eq(p3t1755.resume(part(0, 0x29, [1, 0x28]), W), 55000)
+    test.assert_eq(p3t1755.shut_down(part(0, 0x68, [1, 0x69]), W), 220000)
+
+@test
+fn test_the_rate_is_written_alone() [io, hw]
+    test.assert_eq(p3t1755.set_rate(part(0, 0x28, [1, 0x68]), W, p3t1755.RATE_220_MS), 220000)
+    // SD stays set.
+    test.assert_eq(p3t1755.set_rate(part(0, 0x29, [1, 0x09]), W, p3t1755.RATE_27_5_MS), 27500)
+    test.assert_eq(p3t1755.set_rate(part(0, 0x28, [1, 0x48]), W, p3t1755.RATE_110_MS), 110000)
+    test.assert_eq(p3t1755.set_rate(part(0, 0x28, []), W, 4), -1)
+    test.assert_eq(p3t1755.set_rate(part(0, 0x28, []), W, -1), -1)
+    // A refused write answers -1.
+    test.assert_eq(p3t1755.set_rate(part(0, 0x28, [1, 0x00]), W, 2), -1)
+    test.assert(p3t1755.rate(part(0, 0x48, []), W) == Some(2))
+
+@test
+fn test_an_update_never_writes_os() [io, hw]
+    // A configuration byte read with OS set, which a P3T1755 never
+    // answers, is written back without it.
+    test.assert_eq(p3t1755.update_conf(part(0, 0xA8, [1, 0x28]), W, 0, 0), 0x28)
+    test.assert_eq(p3t1755.update_conf(part(0, 0x28, [1, 0x2C]), W, 0, p3t1755.CONF_POL), 0x2C)
+    test.assert_eq(p3t1755.update_conf(part(0, 0x3E, [1, 0x20]), W,
+                                       p3t1755.CONF_FAULTS | p3t1755.CONF_POL | p3t1755.CONF_TM, 0),
+                                       0x20)
+
+@test
+fn test_the_identity_is_the_configuration_byte() [io, hw]
+    match p3t1755.identify(part(0, 0x28, []), W)
+        Some(id) =>
+            test.assert_eq(id.who, p3t1755.CONF_RESET)
+            test.assert(id.rev == None)
+        None     => test.assert(false)
+    match p3t1755.identify(part(0, 0x69, []), W)
+        Some(id) => test.assert_eq(id.who, 0x69)
+        None     => test.assert(false)
+
+@test
+fn test_registers_a_p3t1755_cannot_hold_are_not_identified() [io, hw]
+    test.assert(p3t1755.identify(part(0, 0xA8, []), W) == None)
+    let low = FakeP3t { addr: 0x48, temp: 0, conf: 0x28, tlow: 0x4B01, thigh: 0x5000, expect: [] }
+    test.assert(p3t1755.identify(low, W) == None)
+    let high = FakeP3t { addr: 0x48, temp: 0, conf: 0x28, tlow: 0x4B00, thigh: 0x5008, expect: [] }
+    test.assert(p3t1755.identify(high, W) == None)
+
+@test
+fn test_the_power_up_values() [io, hw]
+    test.assert(p3t1755.at_reset(part(0, 0x28, []), W))
+    test.assert(not p3t1755.at_reset(part(0, 0x29, []), W))
+    let moved = FakeP3t { addr: 0x48, temp: 0, conf: 0x28, tlow: 0x4A00, thigh: 0x5000, expect: [] }
+    test.assert(not p3t1755.at_reset(moved, W))
+    let high = FakeP3t { addr: 0x48, temp: 0, conf: 0x28, tlow: 0x4B00, thigh: 0x5100, expect: [] }
+    test.assert(not p3t1755.at_reset(high, W))
+    test.assert(p3t1755.restore(part(0, 0x69, []), W))
+
+// ── The driver's type over the board's handles ───────────────────────
+//
+// On a host the board's I2C bus is absent hardware: every transfer is
+// refused, so each method answers as for a part that does not answer.
+
+@test
+fn test_the_driver_over_a_bus_with_no_part() [io, hw]
+    let d = P3t1755.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, W)
+    test.assert(d.config() == None)
+    test.assert_eq(d.shut_down(), -1)
+    test.assert_eq(d.resume(), -1)
+    test.assert_eq(d.one_shot(), -1)
+    test.assert(d.conversion_rate() == None)
+    test.assert_eq(d.set_conversion_rate(1), -1)
+    test.assert(d.limit_low() == None)
+    test.assert(d.limit_high() == None)
+    test.assert(not d.set_limit_low(TempMilliC { milli_c: 74000 }))
+    test.assert(not d.set_limit_high(TempMilliC { milli_c: 80000 }))
+    test.assert(not d.at_reset_values())
+    test.assert(not d.restore_defaults())
+    test.assert_eq(d.temp_start(), -1)
+    test.assert(d.temp_read() == None)
+    test.assert(d.device_id() == None)

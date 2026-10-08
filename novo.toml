@@ -1,0 +1,22 @@
+[package]
+name        = "p3t1755-nv"
+version     = "0.1.0"
+description = "A driver for NXP's P3T1755 digital temperature sensor on an I2C bus: the 12-bit temperature in steps of 0.0625 °C through devices-nv's Thermometer trait, a one-shot conversion from shutdown, the conversion period, and the high and low limit registers."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["p3t1755", "temperature", "thermometer", "i2c", "sensor", "frdm-mcxn947"]
+repository  = "https://github.com/novolang/p3t1755-nv"
+maintainers = ["novo-lang"]
+# The toolchain floor: embedded-hal-nv 0.3.0 calls hal.can, which 0.19.3
+# first has.
+novo        = ">= 0.19.3"
+
+[dependencies]
+# The board's I2C bus handle and the I2cBus trait it implements.
+embedded-hal-nv = "^0.3.0"
+# The wiring record a board's device table hands `attach`, the register
+# access over it, and the Thermometer and Identifiable traits the
+# driver implements.
+devices-nv      = "^0.3.0"

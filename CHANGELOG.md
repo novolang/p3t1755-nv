@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 (2026-10-08)
+
+The toolchain floor is 0.19.4.  A build that resolves embedded-hal-nv
+afresh takes 0.3.2, whose floor is 0.19.4, so 0.1.0's floor of 0.19.3
+named a toolchain the dependency does not build on.  Nothing else
+changed.
+
 ## 0.1.0 (2026-10-08)
 
 The first release: a driver for NXP's P3T1755 digital temperature sensor

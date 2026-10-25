@@ -169,7 +169,7 @@ fn period_of(conf: Int) -> Int
 // The configuration register.
 pub fn read_conf<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
     var b: DevBytes = Vec.new()
-    if not dev_bus.wiring_read_into(bus, w, REG_CONF, 1, b)
+    if not dev_bus.wiring_read_into(bus, w, REG_CONF, 1, var b)
         return None
     Some(b[0] as Int)
 
@@ -182,7 +182,7 @@ pub fn write_conf<B: I2cBus>(bus: B, w: DeviceWiring, conf: Int) -> Bool [hw]
 // A two-byte register, its first byte the most significant.
 pub fn read_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?Int [hw]
     var b: DevBytes = Vec.new()
-    if not dev_bus.wiring_read_into(bus, w, reg, 2, b)
+    if not dev_bus.wiring_read_into(bus, w, reg, 2, var b)
         return None
     Some((b[0] as Int << 8) | b[1] as Int)
 
@@ -300,6 +300,7 @@ struct P3t1755
     bus: BoardI2c
     w: DeviceWiring
 
+// cov: skip — the type holds the board's I2C bus handle, which exists only on a board; each method forwards to the function of the same name that the host suite covers, and the FRDM-MCXN947 package's suite runs these lines on the board.
 impl P3t1755
     // The part at `w.addr` on the board's bus `bus`, as the board's
     // device table builds it.  The part needs no pin, so `pins` is not
@@ -362,6 +363,7 @@ impl P3t1755
     fn restore_defaults(self) -> Bool [hw]
         restore(self.bus, self.w)
 
+// cov: skip — the type holds the board's I2C bus handle, which exists only on a board; each method forwards to the function of the same name that the host suite covers, and the FRDM-MCXN947 package's suite runs these lines on the board.
 impl Thermometer[hw] for P3t1755
     // In shutdown, starts a one-shot conversion and answers 12000 us;
     // converting continuously, answers 0; -1 when the part does not
@@ -374,6 +376,7 @@ impl Thermometer[hw] for P3t1755
     fn temp_read(self) -> ?TempMilliC [hw]
         read_temp_reg(self.bus, self.w, REG_TEMP)
 
+// cov: skip — the type holds the board's I2C bus handle, which exists only on a board; each method forwards to the function of the same name that the host suite covers, and the FRDM-MCXN947 package's suite runs these lines on the board.
 impl Identifiable[hw] for P3t1755
     // The configuration byte, when the registers have a P3T1755's shape.
     fn device_id(self) -> ?DeviceId [hw]

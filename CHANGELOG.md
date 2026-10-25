@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 — 2026-10-25
+
+A call that passes a variable to a `var` parameter now writes the `var` marker, which the 0.21.1 compiler asks for (E2050).  The package needs Novo 0.21.1 or later.  No signature and no behaviour changed.
+
 ## 0.1.1 (2026-10-08)
 
 The toolchain floor is 0.19.4.  A build that resolves embedded-hal-nv

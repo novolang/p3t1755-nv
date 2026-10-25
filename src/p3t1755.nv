@@ -1,0 +1,380 @@
+// p3t1755: NXP's P3T1755 digital temperature sensor on an I2C bus.
+//
+// The part measures its own temperature from -40 °C to 125 °C and
+// keeps the result as a 12-bit two's-complement count of 0.0625 °C.  It
+// converts continuously, or once on request from shutdown, and compares
+// each result with a high and a low limit to drive its ALERT pin.  The
+// facts below are from NXP's data sheet, "P3T1755: I3C, I2C-bus
+// Interface, 0.5 °C Accuracy, Digital Temperature Sensor", Rev. 1.3,
+// 28 August 2025.
+//
+// A board's device table binds the part to this driver:
+//
+//     devices
+//         temp  P3t1755  from "p3t1755-nv"  on i2c0  addr 0x48
+//
+// and the board hands `attach` its I2C bus and the wiring.
+//
+// The register map (section 7.5, Tables 13 and 15).  A transaction's
+// first byte is the pointer, whose two low bits select the register;
+// pointers 4 to 255 are reserved.  Every two-byte register sends its
+// most significant byte first.
+//
+//   pointer  register  bytes  access  power-up value
+//   0x00     Temp      2      read    0x0000 until the first conversion
+//   0x01     Conf      1      r/w     0x28
+//   0x02     TLOW      2      r/w     0x4B00, 75 °C
+//   0x03     THIGH     2      r/w     0x5000, 80 °C
+//
+// Temp, TLOW and THIGH hold the count in bits 15 to 4 and zeros in bits
+// 3 to 0 (Tables 16, 17 and 22 to 25).  The configuration register
+// (Table 19) is, from bit 7 down: OS, the one-shot request, which always
+// reads 0 (section 7.5.9); R1 and R0, the conversion period of Table 21
+// (27.5, 55, 110 or 220 ms, 55 ms at power-up); F1 and F0, the fault
+// queue of Table 20; POL, the ALERT pin's polarity; TM, the thermostat
+// mode; and SD, shutdown.  A one-shot conversion takes at most 12 ms
+// (Table 29, tconv(T)).
+//
+// The part has no identification register.  `device_id` reads the
+// configuration and both limits and checks what every P3T1755 must
+// answer: OS reads 0, and the four low bits of each limit read 0.  It
+// then answers the configuration byte as the identity, which is 0x28
+// at power-up, so `device_probe(CONF_RESET)` holds for a part no
+// program has configured.  Neither check tells a P3T1755 from a part
+// with the same register layout, such as one of the LM75 family's
+// 12-bit members; `at_reset_values` adds the limits' power-up values,
+// which narrows the field and proves no more than that.
+//
+// Drivers read for their fixes, nothing ported: NXP's MCUXpresso SDK
+// component (`components/p3t1755/fsl_p3t1755.c`), Zephyr's
+// `drivers/sensor/nxp/p3t1755/p3t1755.c`, and Linux's
+// `drivers/hwmon/lm75.c`, whose table has an entry for the part.  Each
+// fix kept is named at its site.
+
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+
+// The pointers of the four registers (Table 15).
+let REG_TEMP  = 0x00
+let REG_CONF  = 0x01
+let REG_TLOW  = 0x02
+let REG_THIGH = 0x03
+
+// The configuration register's fields (Table 19).
+let CONF_OS     = 0x80
+let CONF_RATE   = 0x60
+let CONF_FAULTS = 0x18
+let CONF_POL    = 0x04
+let CONF_TM     = 0x02
+let CONF_SD     = 0x01
+
+// The power-up values (Table 13).
+let CONF_RESET  = 0x28
+let TLOW_RESET  = 0x4B00
+let THIGH_RESET = 0x5000
+
+// The longest one-shot conversion, in microseconds (Table 29).
+let ONE_SHOT_US = 12000
+
+// The conversion-period codes, R1 and R0 (Table 21).
+let RATE_27_5_MS = 0
+let RATE_55_MS   = 1
+let RATE_110_MS  = 2
+let RATE_220_MS  = 3
+
+// The period of the conversion-period code `code`, in microseconds, or
+// -1 for a code outside 0 to 3.
+//
+// ```novo
+// use p3t1755
+//
+// fn main() [io]
+//     println("${p3t1755.rate_period_us(p3t1755.RATE_55_MS)}")   // 55000
+// ```
+pub fn rate_period_us(code: Int) -> Int
+    match code
+        0 => 27500
+        1 => 55000
+        2 => 110000
+        3 => 220000
+        _ => -1
+
+// The temperature a register word holds: Temp, TLOW or THIGH as read,
+// the count in bits 15 to 4.
+//
+// The count is two's complement with its sign in bit 11 (section
+// 7.5.2: T11 = 1 is a negative temperature), so a word of 0xFFC0 is
+// -0.25 °C.  Fix kept: NXP's SDK component multiplies the count as an
+// unsigned number, and Zephyr's driver tests bit 12 of the 12-bit count,
+// which is never set, so both read -0.25 °C as 255.75 °C.
+//
+// ```novo
+// use p3t1755
+//
+// fn main() [io]
+//     println("${p3t1755.temp_of_word(0x1900).milli_c}")   // 25000
+//     println("${p3t1755.temp_of_word(0xE700).milli_c}")   // -25000
+// ```
+pub fn temp_of_word(word: Int) -> TempMilliC
+    dev_thermo.temp_of_raw((word & 0xFFFF) >> 4, 12, 62500)
+
+// The register word of a temperature, for TLOW or THIGH.
+//
+// The temperature is rounded to the nearest step of 0.0625 °C and held
+// to the range a word holds, -128 °C to 127.9375 °C.  Fix kept: Linux's
+// `lm75_write_temp` clamps a limit and rounds it to the closest step
+// (`DIV_ROUND_CLOSEST`) rather than toward zero, so a limit written and
+// read back moves by at most half a step.
+//
+// ```novo
+// use p3t1755
+// use dev_thermo.{ TempMilliC }
+//
+// fn main() [io]
+//     println("${p3t1755.limit_word(TempMilliC { milli_c: 74000 })}")   // 18944, 0x4A00
+// ```
+pub fn limit_word(t: TempMilliC) -> Int
+    var m = t.milli_c
+    if m > 127937
+        m = 127937
+    if m < -128000
+        m = -128000
+    var steps = (m * 16 + 500) / 1000
+    if m < 0
+        steps = 0 - ((0 - m) * 16 + 500) / 1000
+    (steps & 0xFFF) << 4
+
+// `v` when `ok`, otherwise -1: the answer of a write the part either
+// acknowledged or did not.
+fn acked(ok: Bool, v: Int) -> Int
+    if ok
+        return v
+    -1
+
+// The conversion period a configuration byte selects, in microseconds,
+// or -1 for the -1 of a refused update.
+fn period_of(conf: Int) -> Int
+    if conf < 0
+        return -1
+    rate_period_us((conf & CONF_RATE) >> 5)
+
+// ── Register access, over any I2C bus ────────────────────────────────
+//
+// The functions below take the bus as a type parameter, so the same
+// code runs on a board's bus and on a test's double.  Each answers
+// `None`, `false` or -1 when the part does not acknowledge.
+
+// The configuration register.
+pub fn read_conf<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not dev_bus.wiring_read_into(bus, w, REG_CONF, 1, b)
+        return None
+    Some(b[0] as Int)
+
+// Writes the configuration register.
+pub fn write_conf<B: I2cBus>(bus: B, w: DeviceWiring, conf: Int) -> Bool [hw]
+    var b: DevBytes = Vec.new()
+    let _ = b.push((conf & 0xFF) as u8)
+    dev_bus.wiring_write_from(bus, w, REG_CONF, b)
+
+// A two-byte register, its first byte the most significant.
+pub fn read_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not dev_bus.wiring_read_into(bus, w, reg, 2, b)
+        return None
+    Some((b[0] as Int << 8) | b[1] as Int)
+
+// Writes a two-byte register, the most significant byte first.
+pub fn write_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, word: Int) -> Bool [hw]
+    var b: DevBytes = Vec.new()
+    let _ = b.push(((word >> 8) & 0xFF) as u8)
+    let _ = b.push((word & 0xFF) as u8)
+    dev_bus.wiring_write_from(bus, w, reg, b)
+
+// Reads the configuration register, clears the bits of `clear`, sets
+// those of `set`, and writes it back.  Answers the byte written, or -1.
+//
+// Fixes kept: the register is read from the part each time and never
+// kept in the driver, as Linux's lm75 marks it volatile, since SD and the
+// one-shot change it from outside a program's writes; and OS is cleared
+// in every update, as Linux's entry for the P3T1755 clears bit 7 in each
+// configuration write, so an update never starts a conversion of its
+// own.  Zephyr's driver keeps OS set in its copy of the register.
+pub fn update_conf<B: I2cBus>(bus: B, w: DeviceWiring, clear: Int, set: Int) -> Int [hw]
+    let Some(conf) = read_conf(bus, w) else return -1
+    let next = (conf & (0xFF ^ (clear | CONF_OS))) | set
+    acked(write_conf(bus, w, next), next)
+
+// A temperature register, Temp, TLOW or THIGH.
+pub fn read_temp_reg<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?TempMilliC [hw]
+    let Some(word) = read_word(bus, w, reg) else return None
+    Some(temp_of_word(word))
+
+// Starts a conversion: in shutdown, a one-shot conversion, answering
+// the time it takes; converting continuously, nothing, answering 0;
+// -1 when the part does not acknowledge.  This is `temp_start`.
+pub fn start<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    let Some(conf) = read_conf(bus, w) else return -1
+    if (conf & CONF_SD) == 0
+        return 0
+    fire(bus, w, conf)
+
+// Starts a one-shot conversion, which the part takes only in shutdown
+// (section 7.5.9).  Answers the time it takes, or -1 when the part is
+// converting continuously or does not acknowledge.
+//
+// Fix kept: Zephyr's driver puts the part in shutdown before it sets
+// OS.  A part converting continuously is not sent OS here; what it
+// does with one the data sheet does not say.
+pub fn one_shot<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    let Some(conf) = read_conf(bus, w) else return -1
+    if (conf & CONF_SD) == 0
+        return -1
+    fire(bus, w, conf)
+
+// Writes OS beside the configuration `conf`, which has SD set.
+//
+// Fix kept: the wait answered is the data sheet's longest one-shot
+// conversion, 12 ms, as Zephyr's driver sleeps; the typical 7.8 ms is
+// too short at some temperatures (Figure 26).
+fn fire<B: I2cBus>(bus: B, w: DeviceWiring, conf: Int) -> Int [hw]
+    acked(write_conf(bus, w, conf | CONF_OS), ONE_SHOT_US)
+
+// Sets SD.  The part finishes the conversion in progress first (section
+// 7.5.4), so the answer is the time to wait before it is shut down, one
+// conversion period, or -1.
+pub fn shut_down<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    period_of(update_conf(bus, w, 0, CONF_SD))
+
+// Clears SD, so the part converts continuously.  Answers the time to
+// wait for the first result of its own, one conversion period, or -1.
+pub fn resume<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    period_of(update_conf(bus, w, CONF_SD, 0))
+
+// Sets the conversion period to the code `code`, 0 to 3 (Table 21), and
+// answers the new period in microseconds, or -1 for a code outside 0 to
+// 3 and when the part does not acknowledge.  A result at the new period
+// is in the temperature register one period later.
+//
+// Fix kept: Linux's `lm75_update_interval` writes R1 and R0 alone,
+// through a read-modify-write.  Linux also clears SD in that write;
+// here SD stays as it was, so a part in shutdown stays there.
+pub fn set_rate<B: I2cBus>(bus: B, w: DeviceWiring, code: Int) -> Int [hw]
+    if code < 0 or code > 3
+        return -1
+    period_of(update_conf(bus, w, CONF_RATE, code << 5))
+
+// The conversion-period code the part holds, 0 to 3.
+pub fn rate<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    let Some(conf) = read_conf(bus, w) else return None
+    Some((conf & CONF_RATE) >> 5)
+
+// What the part answers for its identity: the configuration byte, when
+// the registers have the shape every P3T1755 answers (see the module's
+// header), and `None` otherwise or when the part does not acknowledge.
+pub fn identify<B: I2cBus>(bus: B, w: DeviceWiring) -> ?DeviceId [hw]
+    let Some(conf) = read_conf(bus, w) else return None
+    let Some(tlow) = read_word(bus, w, REG_TLOW) else return None
+    let Some(thigh) = read_word(bus, w, REG_THIGH) else return None
+    if (conf & CONF_OS) != 0 or ((tlow | thigh) & 0xF) != 0
+        return None
+    Some(DeviceId { who: conf, rev: None })
+
+// Whether the configuration and both limits hold their power-up values.
+pub fn at_reset<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    read_conf(bus, w) == Some(CONF_RESET) and read_word(bus, w, REG_TLOW) == Some(TLOW_RESET) and read_word(bus, w, REG_THIGH) == Some(THIGH_RESET)
+
+// Writes the power-up values back to the configuration and both limits.
+// The data sheet's other way back, the general call's reset (section
+// 7.3.3), resets every part on the bus that answers the general call.
+pub fn restore<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    write_conf(bus, w, CONF_RESET) and write_word(bus, w, REG_TLOW, TLOW_RESET) and write_word(bus, w, REG_THIGH, THIGH_RESET)
+
+// ── The part on a board's bus ────────────────────────────────────────
+
+// A P3T1755 on a board's I2C bus at the address `w.addr`.
+pub @value
+struct P3t1755
+    bus: BoardI2c
+    w: DeviceWiring
+
+impl P3t1755
+    // The part at `w.addr` on the board's bus `bus`, as the board's
+    // device table builds it.  The part needs no pin, so `pins` is not
+    // kept.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> P3t1755
+        P3t1755 { bus: bus, w: w }
+
+    // The configuration register, or `None`.
+    fn config(self) -> ?Int [hw]
+        read_conf(self.bus, self.w)
+
+    // Puts the part in shutdown and answers the time until it is shut
+    // down, or -1.
+    fn shut_down(self) -> Int [hw]
+        shut_down(self.bus, self.w)
+
+    // Takes the part out of shutdown and answers the time until its
+    // first result, or -1.
+    fn resume(self) -> Int [hw]
+        resume(self.bus, self.w)
+
+    // Starts a one-shot conversion from shutdown and answers the time it
+    // takes, or -1 when the part is not in shutdown or did not
+    // acknowledge.
+    fn one_shot(self) -> Int [hw]
+        one_shot(self.bus, self.w)
+
+    // The conversion-period code, 0 to 3, or `None`.
+    fn conversion_rate(self) -> ?Int [hw]
+        rate(self.bus, self.w)
+
+    // Sets the conversion-period code and answers the new period in
+    // microseconds, or -1.
+    fn set_conversion_rate(self, code: Int) -> Int [hw]
+        set_rate(self.bus, self.w, code)
+
+    // The low limit, TLOW, or `None`.
+    fn limit_low(self) -> ?TempMilliC [hw]
+        read_temp_reg(self.bus, self.w, REG_TLOW)
+
+    // The high limit, THIGH, or `None`.
+    fn limit_high(self) -> ?TempMilliC [hw]
+        read_temp_reg(self.bus, self.w, REG_THIGH)
+
+    // Writes the low limit, rounded to the nearest 0.0625 °C.
+    fn set_limit_low(self, t: TempMilliC) -> Bool [hw]
+        write_word(self.bus, self.w, REG_TLOW, limit_word(t))
+
+    // Writes the high limit, rounded to the nearest 0.0625 °C.
+    fn set_limit_high(self, t: TempMilliC) -> Bool [hw]
+        write_word(self.bus, self.w, REG_THIGH, limit_word(t))
+
+    // Whether the configuration and both limits hold their power-up
+    // values.
+    fn at_reset_values(self) -> Bool [hw]
+        at_reset(self.bus, self.w)
+
+    // Writes the power-up values back to the configuration and both
+    // limits.
+    fn restore_defaults(self) -> Bool [hw]
+        restore(self.bus, self.w)
+
+impl Thermometer[hw] for P3t1755
+    // In shutdown, starts a one-shot conversion and answers 12000 us;
+    // converting continuously, answers 0; -1 when the part does not
+    // acknowledge.
+    fn temp_start(self) -> Int [hw]
+        start(self.bus, self.w)
+
+    // The temperature register, which holds the most recent finished
+    // conversion, or 0 °C before the first one after power-up.
+    fn temp_read(self) -> ?TempMilliC [hw]
+        read_temp_reg(self.bus, self.w, REG_TEMP)
+
+impl Identifiable[hw] for P3t1755
+    // The configuration byte, when the registers have a P3T1755's shape.
+    fn device_id(self) -> ?DeviceId [hw]
+        identify(self.bus, self.w)

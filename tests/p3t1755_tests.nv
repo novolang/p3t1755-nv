@@ -196,7 +196,8 @@ fn test_an_update_never_writes_os() [io, hw]
     test.assert_eq(p3t1755.update_conf(part(0, 0xA8, [1, 0x28]), W, 0, 0), 0x28)
     test.assert_eq(p3t1755.update_conf(part(0, 0x28, [1, 0x2C]), W, 0, p3t1755.CONF_POL), 0x2C)
     test.assert_eq(p3t1755.update_conf(part(0, 0x3E, [1, 0x20]), W,
-                                       p3t1755.CONF_FAULTS | p3t1755.CONF_POL | p3t1755.CONF_TM, 0), 0x20)
+                                       p3t1755.CONF_FAULTS | p3t1755.CONF_POL | p3t1755.CONF_TM, 0),
+                                       0x20)
 
 @test
 fn test_the_identity_is_the_configuration_byte() [io, hw]

@@ -1,6 +1,6 @@
 [package]
 name        = "p3t1755-nv"
-version     = "0.1.2"
+version     = "0.1.3"
 description = "A driver for NXP's P3T1755 digital temperature sensor on an I2C bus: the 12-bit temperature in steps of 0.0625 °C through devices-nv's Thermometer trait, a one-shot conversion from shutdown, the conversion period, and the high and low limit registers."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -15,8 +15,8 @@ novo        = ">= 0.21.1"
 
 [dependencies]
 # The board's I2C bus handle and the I2cBus trait it implements.
-embedded-hal-nv = "^0.3.0"
+embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
 # access over it, and the Thermometer and Identifiable traits the
 # driver implements.
-devices-nv      = "^0.3.0"
+devices-nv      = "^0.4.0"

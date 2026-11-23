@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 — 2026-11-23
+
+The package asks for embedded-hal-nv ^0.4.0 (was ^0.3.0) and devices-nv ^0.4.0 (was ^0.3.0), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".
+
+No signature of the package changed; the suite passes without an edit.
+
+The FRDM-MCXN947's `tests/thermometer_probe.nv`, which reads the part through the board's devices block, builds against the package: flash 26,680 B before and 26,692 B after.
+
 ## 0.1.2 — 2026-10-25
 
 A call that passes a variable to a `var` parameter now writes the `var` marker, which the 0.21.1 compiler asks for (E2050).  The package needs Novo 0.21.1 or later.  No signature and no behaviour changed.
